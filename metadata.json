@@ -1,0 +1,6 @@
+{
+  "name": "Control de Salidas de Aula",
+  "description": "Sistema interactivo de monitoreo y control de pases de salida al baño y pasillo para 34 computadoras con cupo máximo de 3 estudiantes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
