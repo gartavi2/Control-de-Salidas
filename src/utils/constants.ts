@@ -65,6 +65,24 @@ export const DEFAULT_SETTINGS: AppSettings = {
   warningTimeMinutes: 5,
   criticalTimeMinutes: 10,
   soundEnabled: true,
-  viewMode: 'grid',
+  viewMode: 'croquis',
+  themeMode: 'light',
   classroomName: 'Laboratorio de Informática',
 };
+
+/**
+ * Exact spatial arrangement from the classroom sketch (excluding teacher PC):
+ * - Left Wall (top to bottom): 12 -> 7, [Puerta], 6 -> 1
+ * - Center Table (Mesa Central):
+ *     Left side (top to bottom): 13 -> 18
+ *     Right side (top to bottom): 24 -> 19
+ * - Right Wall (top to bottom): 25 -> 34
+ * - Front (bottom): Pizarra & Zona Docente (no clickable PC)
+ */
+export const CROQUIS_LAYOUT = {
+  leftWallBack: [12, 11, 10, 9, 8, 7],
+  leftWallFront: [6, 5, 4, 3, 2, 1],
+  mesaCentralLeft: [13, 14, 15, 16, 17, 18],
+  mesaCentralRight: [24, 23, 22, 21, 20, 19],
+  rightWall: [25, 26, 27, 28, 29, 30, 31, 32, 33, 34],
+} as const;

@@ -5,25 +5,30 @@
 
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  ShieldAlert, 
-  Sparkles, 
-  HelpCircle, 
-  Info, 
-  Monitor, 
-  CheckCircle,
-  X
+import {
+  ShieldAlert,
+  Info,
+  Monitor,
+  X,
+  Map as MapIcon,
+  LayoutGrid,
+  Rows3,
+  WifiOff,
 } from 'lucide-react';
-import { ComputerState, ExitRecord, AppSettings, ExitReason } from './types';
-import { 
-  getInitialComputers, 
-  saveComputers, 
-  getHistory, 
-  saveHistory, 
-  getSettings, 
-  saveSettings 
+import { ComputerState, ExitRecord, AppSettings, ExitReason, ViewMode } from './types';
+import {
+  getInitialComputers,
+  saveComputers,
+  getHistory,
+  saveHistory,
+  getSettings,
+  saveSettings,
+  hydrateFromIndexedDB,
+  requestAndroidPersistentStorage,
+  LocalBackupPayload,
 } from './utils/storage';
 import { playExitSound, playReturnSound, playBlockedSound } from './utils/audio';
+import { useOnlineStatus } from './hooks/usePWAInstall';
 import { Header } from './components/Header';
 import { CapacitySlots } from './components/CapacitySlots';
 import { ComputerGrid } from './components/ComputerGrid';
@@ -32,15 +37,18 @@ import { HistoryModal } from './components/HistoryModal';
 import { SettingsModal } from './components/SettingsModal';
 
 export default function App() {
-  // Primary States
   const [computers, setComputers] = useState<ComputerState[]>(() => getInitialComputers());
   const [history, setHistory] = useState<ExitRecord[]>(() => getHistory());
   const [settings, setSettings] = useState<AppSettings>(() => getSettings());
+  const [isStoragePersisted, setIsStoragePersisted] = useState<boolean>(false);
 
-  // Real-time ticking clock (every 1 second)
   const [currentTimeMs, setCurrentTimeMs] = useState<number>(Date.now());
+  const [systemPrefersDark, setSystemPrefersDark] = useState<boolean>(() =>
+    typeof window !== 'undefined'
+      ? window.matchMedia('(prefers-color-scheme: dark)').matches
+      : false
+  );
 
-  // UI Interactive States
   const [modalPcNumber, setModalPcNumber] = useState<number | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState<boolean>(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
@@ -49,7 +57,52 @@ export default function App() {
   const [shakingPcNumber, setShakingPcNumber] = useState<number | null>(null);
   const [blockedAlertMessage, setBlockedAlertMessage] = useState<string | null>(null);
 
-  // Sync timer
+  const isOnline = useOnlineStatus();
+
+  // Hydrate from Android IndexedDB & request persistent storage
+  useEffect(() => {
+    let mounted = true;
+    hydrateFromIndexedDB().then((hydrated) => {
+      if (!mounted) return;
+      if (hydrated.computers) setComputers(hydrated.computers);
+      if (hydrated.history) setHistory(hydrated.history);
+      if (hydrated.settings) setSettings(hydrated.settings);
+    });
+    requestAndroidPersistentStorage().then((persisted) => {
+      if (mounted) setIsStoragePersisted(persisted);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  // Listen to system dark mode preference
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const handler = (e: MediaQueryListEvent) => setSystemPrefersDark(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+
+  const isDarkActive =
+    settings.themeMode === 'dark' ||
+    (settings.themeMode === 'system' && systemPrefersDark);
+
+  // Sync .dark class & Android status bar theme-color
+  useEffect(() => {
+    const root = document.documentElement;
+    if (isDarkActive) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme) {
+      metaTheme.setAttribute('content', isDarkActive ? '#0f172a' : '#f1f5f9');
+    }
+  }, [isDarkActive]);
+
+  // Real-time 1s timer
   useEffect(() => {
     const timer = setInterval(() => {
       setCurrentTimeMs(Date.now());
@@ -57,7 +110,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Save changes to localStorage
+  // Persist locally
   useEffect(() => {
     saveComputers(computers);
   }, [computers]);
@@ -70,15 +123,10 @@ export default function App() {
     saveSettings(settings);
   }, [settings]);
 
-  // Derived: active computers outside
-  const activeComputers = useMemo(() => {
-    return computers.filter((c) => c.isOut);
-  }, [computers]);
-
+  const activeComputers = useMemo(() => computers.filter((c) => c.isOut), [computers]);
   const outsideCount = activeComputers.length;
   const isAtLimit = outsideCount >= settings.maxAllowedOutside;
 
-  // Completed exits today
   const completedExitsToday = useMemo(() => {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
@@ -86,7 +134,8 @@ export default function App() {
     return history.filter((h) => h.startTime >= startMs).length;
   }, [history]);
 
-  // Filtered computers based on search and "only out" toggle
+  const hasActiveFilters = onlyOutFilter || searchQuery.trim().length > 0;
+
   const filteredComputers = useMemo(() => {
     return computers.filter((c) => {
       if (onlyOutFilter && !c.isOut) {
@@ -109,54 +158,57 @@ export default function App() {
     });
   }, [computers, onlyOutFilter, searchQuery]);
 
-  // Handle student return from a workstation
-  const handleReturn = useCallback((pcNumber: number) => {
-    setComputers((prev) => {
-      const target = prev.find((c) => c.number === pcNumber);
-      if (!target || !target.isOut) return prev;
+  const matchingNumbers = useMemo(
+    () => new Set(filteredComputers.map((c) => c.number)),
+    [filteredComputers]
+  );
 
-      const now = Date.now();
-      const startTime = target.startTime || now;
-      const durationSeconds = Math.max(1, Math.round((now - startTime) / 1000));
+  const handleReturn = useCallback(
+    (pcNumber: number) => {
+      setComputers((prev) => {
+        const target = prev.find((c) => c.number === pcNumber);
+        if (!target || !target.isOut) return prev;
 
-      const newRecord: ExitRecord = {
-        id: target.activeExitId || `exit-${now}-${pcNumber}`,
-        computerNumber: pcNumber,
-        reason: target.reason || 'baño',
-        customReasonNote: target.customReasonNote,
-        startTime,
-        endTime: now,
-        durationSeconds,
-      };
+        const now = Date.now();
+        const startTime = target.startTime || now;
+        const durationSeconds = Math.max(1, Math.round((now - startTime) / 1000));
 
-      // Add to history log
-      setHistory((prevHistory) => [newRecord, ...prevHistory]);
+        const newRecord: ExitRecord = {
+          id: target.activeExitId || `exit-${now}-${pcNumber}`,
+          computerNumber: pcNumber,
+          reason: target.reason || 'baño',
+          customReasonNote: target.customReasonNote,
+          startTime,
+          endTime: now,
+          durationSeconds,
+        };
 
-      playReturnSound(settings.soundEnabled);
+        setHistory((prevHistory) => [newRecord, ...prevHistory]);
+        playReturnSound(settings.soundEnabled);
 
-      return prev.map((c) => {
-        if (c.number === pcNumber) {
-          return {
-            ...c,
-            isOut: false,
-            activeExitId: undefined,
-            startTime: undefined,
-            reason: undefined,
-            customReasonNote: undefined,
-          };
-        }
-        return c;
+        return prev.map((c) =>
+          c.number === pcNumber
+            ? {
+                ...c,
+                isOut: false,
+                activeExitId: undefined,
+                startTime: undefined,
+                reason: undefined,
+                customReasonNote: undefined,
+              }
+            : c
+        );
       });
-    });
-  }, [settings.soundEnabled]);
+    },
+    [settings.soundEnabled]
+  );
 
-  // Handle return for all active workstations
   const handleReturnAll = useCallback(() => {
     const now = Date.now();
     const recordsToAdd: ExitRecord[] = [];
 
-    setComputers((prev) => {
-      const updated = prev.map((c) => {
+    setComputers((prev) =>
+      prev.map((c) => {
         if (c.isOut) {
           const startTime = c.startTime || now;
           const durationSeconds = Math.max(1, Math.round((now - startTime) / 1000));
@@ -179,9 +231,8 @@ export default function App() {
           };
         }
         return c;
-      });
-      return updated;
-    });
+      })
+    );
 
     if (recordsToAdd.length > 0) {
       setHistory((prev) => [...recordsToAdd, ...prev]);
@@ -189,41 +240,40 @@ export default function App() {
     }
   }, [settings.soundEnabled]);
 
-  // Handle switch toggle on a computer
-  const handleToggle = useCallback((pcNumber: number) => {
-    const target = computers.find((c) => c.number === pcNumber);
-    if (!target) return;
+  const handleToggle = useCallback(
+    (pcNumber: number) => {
+      const target = computers.find((c) => c.number === pcNumber);
+      if (!target) return;
 
-    if (target.isOut) {
-      // It's currently out -> return to class
-      handleReturn(pcNumber);
-    } else {
-      // It's currently in class -> attempt exit
-      if (outsideCount >= settings.maxAllowedOutside) {
-        // Exceeded limit!
-        setShakingPcNumber(pcNumber);
-        setTimeout(() => setShakingPcNumber(null), 500);
-
-        playBlockedSound(settings.soundEnabled);
-
-        setBlockedAlertMessage(
-          `No se puede autorizar la salida de la PC-${pcNumber.toString().padStart(2, '0')}. El cupo máximo de ${settings.maxAllowedOutside} estudiantes ya está ocupado.`
-        );
-
-        setTimeout(() => {
-          setBlockedAlertMessage(null);
-        }, 5000);
+      if (target.isOut) {
+        handleReturn(pcNumber);
       } else {
-        // Allowed -> Open reason selector modal
-        setModalPcNumber(pcNumber);
-      }
-    }
-  }, [computers, outsideCount, settings.maxAllowedOutside, settings.soundEnabled, handleReturn]);
+        if (outsideCount >= settings.maxAllowedOutside) {
+          setShakingPcNumber(pcNumber);
+          setTimeout(() => setShakingPcNumber(null), 500);
+          playBlockedSound(settings.soundEnabled);
 
-  // Confirm and start exit from modal
+          setBlockedAlertMessage(
+            `No se puede autorizar la salida de la PC-${pcNumber
+              .toString()
+              .padStart(2, '0')}. El cupo máximo de ${
+              settings.maxAllowedOutside
+            } estudiantes ya está ocupado.`
+          );
+
+          setTimeout(() => {
+            setBlockedAlertMessage(null);
+          }, 5000);
+        } else {
+          setModalPcNumber(pcNumber);
+        }
+      }
+    },
+    [computers, outsideCount, settings.maxAllowedOutside, settings.soundEnabled, handleReturn]
+  );
+
   const handleConfirmExit = useCallback(
     (pcNumber: number, reason: ExitReason, customNote?: string) => {
-      // Verify limit isn't broken
       const currentActiveCount = computers.filter((c) => c.isOut).length;
       if (currentActiveCount >= settings.maxAllowedOutside) {
         setBlockedAlertMessage(
@@ -238,19 +288,18 @@ export default function App() {
       const newExitId = `exit-${now}-${pcNumber}`;
 
       setComputers((prev) =>
-        prev.map((c) => {
-          if (c.number === pcNumber) {
-            return {
-              ...c,
-              isOut: true,
-              activeExitId: newExitId,
-              startTime: now,
-              reason,
-              customReasonNote: customNote,
-            };
-          }
-          return c;
-        })
+        prev.map((c) =>
+          c.number === pcNumber
+            ? {
+                ...c,
+                isOut: true,
+                activeExitId: newExitId,
+                startTime: now,
+                reason,
+                customReasonNote: customNote,
+              }
+            : c
+        )
       );
 
       playExitSound(settings.soundEnabled);
@@ -260,15 +309,25 @@ export default function App() {
     [computers, settings.maxAllowedOutside, settings.soundEnabled]
   );
 
+  const handleRestoreBackup = useCallback((payload: LocalBackupPayload) => {
+    setComputers(payload.computers);
+    setHistory(payload.history);
+    setSettings(payload.settings);
+  }, []);
+
+  const handleViewModeChange = (mode: ViewMode) => {
+    setSettings((prev) => ({ ...prev, viewMode: mode }));
+  };
+
   return (
-    <div className="min-h-screen bg-slate-100/90 text-slate-900 flex flex-col font-sans antialiased">
-      {/* Top Header */}
+    <div className="min-h-screen bg-slate-100 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans antialiased transition-colors">
       <Header
         totalComputers={computers.length}
         outsideCount={outsideCount}
         maxLimit={settings.maxAllowedOutside}
         completedExitsToday={completedExitsToday}
         settings={settings}
+        isDarkActive={isDarkActive}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
         onlyOutFilter={onlyOutFilter}
@@ -278,19 +337,24 @@ export default function App() {
         onToggleSound={() =>
           setSettings((prev) => ({ ...prev, soundEnabled: !prev.soundEnabled }))
         }
+        onToggleTheme={() =>
+          setSettings((prev) => ({
+            ...prev,
+            themeMode: isDarkActive ? 'light' : 'dark',
+          }))
+        }
         onReturnAll={handleReturnAll}
       />
 
-      {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5 space-y-6">
-        {/* Real-time Blocked Limit Warning Toast */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-4 sm:py-5 space-y-5">
+        {/* Blocked Limit Alert */}
         <AnimatePresence>
           {blockedAlertMessage && (
             <motion.div
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
-              className="bg-rose-600 text-white px-4 py-3 rounded-xl shadow-lg flex items-center justify-between gap-3 border border-rose-500"
+              className="bg-rose-600 dark:bg-rose-700 text-white px-4 py-3 rounded-xl shadow-lg flex items-center justify-between gap-3 border border-rose-500"
             >
               <div className="flex items-center space-x-2.5">
                 <ShieldAlert className="w-5 h-5 text-amber-200 shrink-0" />
@@ -299,7 +363,8 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setBlockedAlertMessage(null)}
-                className="text-rose-100 hover:text-white p-1 rounded-md hover:bg-rose-700/60"
+                className="min-w-[40px] min-h-[40px] flex items-center justify-center text-rose-100 hover:text-white rounded-lg hover:bg-rose-700/60"
+                aria-label="Cerrar alerta"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -307,7 +372,7 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* 3 Exit Slots Visualizer (Active Passes) */}
+        {/* Active Exit Passes */}
         <section aria-labelledby="active-slots-heading">
           <h2 id="active-slots-heading" className="sr-only">
             Pases de Salida Activos
@@ -320,42 +385,78 @@ export default function App() {
           />
         </section>
 
-        {/* Workstations Grid Section */}
+        {/* Workstations Section */}
         <section aria-labelledby="computers-grid-heading" className="space-y-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-1">
-            <div className="flex items-center space-x-2">
-              <div className="w-2.5 h-2.5 rounded-full bg-indigo-600" />
-              <h2 id="computers-grid-heading" className="text-base font-extrabold text-slate-900 tracking-tight">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-1">
+            <div>
+              <h2
+                id="computers-grid-heading"
+                className="text-base font-extrabold text-slate-900 dark:text-white tracking-tight"
+              >
                 Puestos de Trabajo (34 Computadoras)
               </h2>
-              <span className="text-xs text-slate-500 font-medium">
-                — {filteredComputers.length} mostradas
-              </span>
+              <p className="text-xs text-slate-600 dark:text-slate-400 tabular-nums">
+                {filteredComputers.length} de {computers.length} mostradas ·{' '}
+                {settings.viewMode === 'croquis'
+                  ? 'Vista Croquis del Laboratorio'
+                  : settings.viewMode === 'classroom'
+                  ? 'Vista Filas de Aula'
+                  : 'Vista Cuadrícula'}
+              </p>
             </div>
 
-            {/* Legend guide */}
-            <div className="flex items-center space-x-4 text-[11px] text-slate-600">
-              <div className="flex items-center space-x-1.5">
-                <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                <span>En clase (Inactivo)</span>
-              </div>
-              <div className="flex items-center space-x-1.5">
-                <span className="w-2 h-2 rounded-full bg-indigo-600" />
-                <span>Afuera (Activo)</span>
-              </div>
-              <div className="flex items-center space-x-1.5">
-                <span className="w-2 h-2 rounded-full bg-rose-500" />
-                <span>+10 min fuera</span>
-              </div>
+            {/* Quick View Mode Segmented Switcher */}
+            <div
+              className="inline-flex items-center gap-1 p-1 bg-slate-200/80 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl self-start sm:self-auto"
+              role="group"
+              aria-label="Organización Visual"
+            >
+              <button
+                type="button"
+                onClick={() => handleViewModeChange('croquis')}
+                className={`min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all whitespace-nowrap ${
+                  settings.viewMode === 'croquis'
+                    ? 'bg-white dark:bg-slate-800 text-indigo-700 dark:text-indigo-300 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <MapIcon className="w-3.5 h-3.5" />
+                <span>Croquis</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleViewModeChange('grid')}
+                className={`min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all whitespace-nowrap ${
+                  settings.viewMode === 'grid'
+                    ? 'bg-white dark:bg-slate-800 text-indigo-700 dark:text-indigo-300 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <LayoutGrid className="w-3.5 h-3.5" />
+                <span>Cuadrícula</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleViewModeChange('classroom')}
+                className={`min-h-[38px] px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all whitespace-nowrap ${
+                  settings.viewMode === 'classroom'
+                    ? 'bg-white dark:bg-slate-800 text-indigo-700 dark:text-indigo-300 shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <Rows3 className="w-3.5 h-3.5" />
+                <span>Filas</span>
+              </button>
             </div>
           </div>
 
-          {/* If search result is empty */}
-          {filteredComputers.length === 0 ? (
-            <div className="bg-white rounded-2xl p-12 text-center border border-slate-200 shadow-2xs">
-              <Monitor className="w-12 h-12 mx-auto text-slate-300 mb-3" />
-              <h3 className="font-bold text-slate-800 text-base">No se encontraron puestos</h3>
-              <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+          {filteredComputers.length === 0 && settings.viewMode !== 'croquis' ? (
+            <div className="bg-white dark:bg-slate-900 rounded-2xl p-10 text-center border border-slate-200 dark:border-slate-800">
+              <Monitor className="w-12 h-12 mx-auto text-slate-300 dark:text-slate-700 mb-3" />
+              <h3 className="font-bold text-slate-800 dark:text-slate-100 text-base">
+                No se encontraron puestos
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-sm mx-auto">
                 No hay computadoras que coincidan con los filtros aplicados.
               </p>
               <button
@@ -364,7 +465,7 @@ export default function App() {
                   setSearchQuery('');
                   setOnlyOutFilter(false);
                 }}
-                className="mt-4 px-4 py-2 text-xs font-semibold bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition-colors"
+                className="mt-4 min-h-[44px] px-4 py-2 text-xs font-semibold bg-slate-900 dark:bg-indigo-600 text-white rounded-xl hover:bg-slate-800 dark:hover:bg-indigo-700 transition-colors"
               >
                 Restablecer Filtros
               </button>
@@ -372,6 +473,9 @@ export default function App() {
           ) : (
             <ComputerGrid
               computers={filteredComputers}
+              allComputers={computers}
+              matchingNumbers={matchingNumbers}
+              hasActiveFilters={hasActiveFilters}
               currentTimeMs={currentTimeMs}
               settings={settings}
               isBlockedByLimit={isAtLimit}
@@ -383,22 +487,31 @@ export default function App() {
         </section>
       </main>
 
-      {/* Classroom Rules Footer */}
-      <footer className="bg-white border-t border-slate-200 mt-8 py-4 px-4 sm:px-6">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-2">
+      {/* Offline Local Mode Indicator */}
+      {!isOnline && (
+        <div className="fixed bottom-4 left-4 z-40 flex items-center gap-2 rounded-xl bg-slate-900 dark:bg-slate-800 border border-slate-700 px-3.5 py-2 text-xs font-medium text-white shadow-lg">
+          <WifiOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+          <span>Modo sin conexión · Guardado local activo</span>
+        </div>
+      )}
+
+      {/* Footer */}
+      <footer className="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 mt-6 py-4 px-4 sm:px-6">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 dark:text-slate-400 gap-2">
           <div className="flex items-center space-x-2">
-            <Info className="w-4 h-4 text-indigo-500 shrink-0" />
+            <Info className="w-4 h-4 text-indigo-500 dark:text-indigo-400 shrink-0" />
             <span>
-              <strong>Regla Institucional:</strong> Máximo 3 estudiantes simultáneos fuera del aula. Al regresar, marca su casilla para liberar el cupo.
+              <strong className="text-slate-700 dark:text-slate-200">Regla Institucional:</strong>{' '}
+              Máximo {settings.maxAllowedOutside} estudiantes simultáneos fuera del aula.
             </span>
           </div>
-          <div className="text-[11px] text-slate-400">
-            Laboratorio de Computación • 34 Estaciones
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            Laboratorio de Computación · 34 Estaciones · Guardado Local
           </div>
         </div>
       </footer>
 
-      {/* Exit Reason Selection Modal */}
+      {/* Modals */}
       <ExitReasonModal
         isOpen={modalPcNumber !== null}
         pcNumber={modalPcNumber}
@@ -406,7 +519,6 @@ export default function App() {
         onConfirm={handleConfirmExit}
       />
 
-      {/* History Log Modal */}
       <HistoryModal
         isOpen={isHistoryOpen}
         onClose={() => setIsHistoryOpen(false)}
@@ -414,12 +526,15 @@ export default function App() {
         onClearHistory={() => setHistory([])}
       />
 
-      {/* Classroom Settings Modal */}
       <SettingsModal
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         settings={settings}
+        computers={computers}
+        history={history}
+        isStoragePersisted={isStoragePersisted}
         onSave={setSettings}
+        onRestoreBackup={handleRestoreBackup}
       />
     </div>
   );

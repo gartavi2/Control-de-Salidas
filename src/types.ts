@@ -29,11 +29,15 @@ export interface ComputerState {
   customReasonNote?: string;
 }
 
+export type ViewMode = 'croquis' | 'grid' | 'classroom';
+export type ThemeMode = 'light' | 'dark' | 'system';
+
 export interface AppSettings {
   maxAllowedOutside: number;
   warningTimeMinutes: number;
   criticalTimeMinutes: number;
   soundEnabled: boolean;
-  viewMode: 'grid' | 'classroom';
+  viewMode: ViewMode;
+  themeMode: ThemeMode;
   classroomName: string;
 }
